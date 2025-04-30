@@ -1,0 +1,277 @@
+
+
+float rest_density = 300;
+
+int max_neighbors = 80;
+float mass = f@mass;
+
+float density_ratio = f@density / rest_density;
+float new_radius = 0.4 * pow(density_ratio, -0.5);
+new_radius = lerp(f@radius, new_radius, 0.2);
+f@radius = clamp(new_radius, 0.2, 0.5);
+float radius = f@radius;
+ 
+float c = 10; 
+int gamma = 2;
+float B = rest_density * c * c;
+B /= gamma;
+ 
+int neighbors[];
+vector neighbor_positions[];
+float neighbor_densities[];
+float neighbor_pressures[]; 
+vector neighbor_velocities[]; 
+vector position = v@P;
+vector velocity = v@v;
+vector prev_v = velocity;
+vector force;
+
+int handle = pcopen("op:/obj/fluid_sim/popnet/sopsolver1/out_particles", "P", @P, radius, max_neighbors);
+ 
+int num_neighbors = pcnumfound(handle); 
+ 
+if (num_neighbors > 0) { 
+    while (pciterate(handle)) {
+         int pt; 
+        vector Pj, Vj;
+        float density_j, pressure_j;
+        
+        pcimport(handle, "point.number", pt);
+        pcimport(handle, "P", Pj);
+        pcimport(handle, "V", Vj);
+        pcimport(handle, "density", density_j);
+        pcimport(handle, "pressure", pressure_j);
+        
+        if (pt == @ptnum) continue;
+        
+        append(neighbors, pt);
+        append(neighbor_positions, Pj);
+        append(neighbor_velocities, Vj);
+        append(neighbor_densities, density_j);
+        append(neighbor_pressures, pressure_j);
+    }
+}
+pcclose(handle);
+        
+i[]@neighbors = neighbors; 
+
+if (f@age > 0.1 & len(i@neighbors) < 5) {
+    i@dead = 1;
+} 
+
+float poly6(float r, f) {
+    if (r < 0 || r > f) {
+        return 0.0;
+    }
+    // note thast you changed 64 to 128!! bc system was mad unstablre
+    float cons = 315.0 / (128.0 * M_PI * pow(f, 9));
+    float term = pow(f * f - r * r, 3);
+    return cons * term;
+} 
+
+float grad_poly6(float r, f) {
+    if (r < 0 || r > f) {
+        return 0.0; 
+    }
+    float cons = -945.0 / (64.0 * M_PI * pow(f, 9));
+    float term = r * pow(f * f - r * r, 2);
+    return cons * term;
+} 
+
+float poly6_laplacian(float r, f) {
+    if (r < 0 || r > f) {
+        return 0.0; 
+    }
+
+    float cons = -945.0 / (64.0 * M_PI * pow(f, 9));
+    float term1 = (f * f - r * r);
+    float term2 = (f * f - 5.0 * r * r);
+    return cons * term1 * term2;
+}
+
+float calc_density(float rest_density, radius; vector position; int num; float mass; int neighbors[]; vector neighbor_positions[]; int handle) {
+    
+    float density = 0.;
+    foreach(int i; int pt; neighbors) {
+        vector Pj = neighbor_positions[i];
+        
+        float distance = distance(position, Pj);
+        
+        density += mass * poly6(distance, radius);  // Accumulate density
+    }
+
+    density = max(density, rest_density / 2);
+    density = min(density, rest_density * 1.25);
+    return density;
+}
+
+vector calc_pressure(float pressure, radius, mass; vector position;
+                     int neighbors[]; vector neighbor_positions[]; 
+                     float neighbor_densities[], neighbor_pressures[])  {
+
+    vector p_force = {0, 0, 0};
+
+    foreach(int i; int pt; neighbors) {
+        vector Pj = neighbor_positions[i];
+        float density_j = neighbor_densities[i];
+        float pressure_j = neighbor_pressures[i];
+
+        vector r_ij = position - Pj;
+        float r = length(r_ij);
+        vector r_dir = normalize(r_ij);
+        
+        if (r > radius || r == 0) continue;
+
+        float W_grad = (-45 / (M_PI * pow(radius, 6))) * pow(radius - r, 2);
+        vector grad_W = r_dir * W_grad;
+
+        float mean_pressure = (pressure + pressure_j) * 0.5;
+        vector pressure_term = mean_pressure * (mass / density_j) * grad_W;
+        p_force += -pressure_term;
+    }
+    return p_force;
+}
+
+vector compute_surface_norm(int neighbors[]; vector neighbor_positions[]; float neighbor_densities[]; float mass, radius; vector position; int handle) {
+    vector norm = {0, 0, 0};
+    
+    foreach(int i; int pt; neighbors) {
+            float density_j = neighbor_densities[i];
+            vector Pj = neighbor_positions[i];
+            
+            vector r_j = Pj - position;
+            float r = length(r_j);
+            vector r_dir = normalize(r_j);
+
+            vector W = grad_poly6(r, radius) * r_dir;
+            
+            norm += W * mass / density_j;
+        }
+    return norm;
+}
+
+float compute_laplacian_cS(int neighbors[]; vector neighbor_positions[]; float neighbor_densities[]; float mass, density, radius; vector position; int handle) {
+    float laplacian_cS = 0.0;
+    
+    foreach(int i; int pt; neighbors) {
+        vector Pj = neighbor_positions[i];
+        float density_j = neighbor_densities[i];
+            
+        float r = length(Pj - position);
+        float W_lap = poly6_laplacian(r, radius);
+        laplacian_cS += (mass / density_j) * W_lap;
+    }
+
+    return laplacian_cS;
+}
+
+float compute_curvature(int neighbors[]; vector neighbor_positions[]; float neighbor_densities[]; float mass, density, radius; vector position, n; int handle) {
+    float laplacian_cS = compute_laplacian_cS(neighbors, neighbor_positions, neighbor_densities, mass, density, radius, position, handle);
+    return -laplacian_cS / max(length(n), 1e-6);
+}
+
+vector compute_surface_tension(vector normal; float k) {   
+    float delta_s = length(normal);
+    float sigma = 0.1;
+    
+    float threshold = 0.01;
+    if (delta_s < threshold) {
+        return {0, 0, 0};
+    }
+
+    return sigma * k * delta_s * normalize(normal);
+}
+
+float viscosity_kernel_laplacian(float r, h) {
+    if (r >= 0 && r <= h) {
+        return (45.0 / (M_PI * pow(h, 6))) * (h - r);
+    }
+    return 0.0; 
+}
+ 
+vector calc_viscosity(int neighbors[]; vector neighbor_positions[], neighbor_velocities[]; float neighbor_densities[]; float radius; vector position, velocity; float mass; float mu; int handle) {
+    vector viscosity_force = {0, 0, 0};
+    foreach(int i; int pt; neighbors) {
+        vector Pj = neighbor_positions[i];
+        float density_j = neighbor_densities[i];
+        vector Vj = neighbor_velocities[i];  
+        
+        vector r_ij = position - Pj;
+        float r = length(r_ij);
+        float W_laplacian = viscosity_kernel_laplacian(r, radius);    
+    
+        if (r > 0 && r < radius) { 
+            vector force_ij = mu * (mass / density_j) * (Vj - velocity) * W_laplacian;
+            viscosity_force += force_ij;;
+        }
+    }
+    return viscosity_force;
+}
+
+// density + pressure + ST
+
+float local_density = calc_density(rest_density, radius, position, @ptnum, mass, neighbors, neighbor_positions, handle);
+f@density = local_density;
+
+float ratio = local_density / rest_density;   
+float p = B * (pow(ratio, gamma) - 1.0);;
+float pressure = clamp(p, 0.001, 50000);
+
+f@pressure = pressure;  
+vector pressure_force = calc_pressure(pressure, radius, mass, position, neighbors, neighbor_positions, neighbor_densities, neighbor_pressures);
+float max_p_force = 1000.0;
+pressure_force = clamp(pressure_force, -max_p_force, max_p_force);
+v@pforce = pressure_force;
+force = pressure_force; 
+
+
+vector s_normal = compute_surface_norm(neighbors, neighbor_positions, neighbor_densities, mass, radius, position, handle);
+float k = compute_curvature(neighbors, neighbor_positions, neighbor_densities, mass, local_density, radius, position, s_normal, handle);
+
+vector surface_tension = compute_surface_tension(s_normal, k);
+force += surface_tension;
+
+/// VISCOSITY AND GRAVITY 
+float mu = 0.01;
+
+vector gravity = {0, -9.8, 0};
+vector gravity_force = local_density * gravity;
+force += gravity_force;
+
+vector viscosity_force = calc_viscosity(neighbors, neighbor_positions, neighbor_velocities, neighbor_densities, radius, position, velocity, mass, mu, handle);
+force += viscosity_force;
+
+if (@ptnum == 10) {
+    // printf("visc: %f, %f, %f \n", viscosity_force.x,viscosity_force.y,viscosity_force.z);
+    // printf("press: %f, %f, %f \n", pressure_force.x,pressure_force.y,pressure_force.z);
+    // printf("st: %f, %f, %f \n", surface_tension.x,surface_tension.y,surface_tension.z);
+}
+
+// attempt at vorticity
+/*
+vector curl = {0, 0, 0};
+ 
+foreach (int i; int pt; neighbors) {
+    vector Vj = neighbor_velocities[i];
+    vector Pj = neighbor_positions[i];
+    vector r_ij = position - Pj;
+    float r = length(r_ij);
+
+    if (r > radius || r == 0) continue;
+
+    float gradW = grad_poly6(r, radius);
+    curl += cross(Vj - velocity, normalize(r_ij)) * gradW;
+}
+
+v@vorticity = curl;
+
+curl *= 0.0003;
+//force += curl;
+*/
+
+v@force = force;
+vector acceleration = v@force / local_density;
+velocity += acceleration * @TimeInc;
+
+// lose some energy
+v@v = velocity * 0.99; 
