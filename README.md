@@ -1,1 +1,1 @@
-# SeniorDesignFluidSim
+# SPHFluidSim
